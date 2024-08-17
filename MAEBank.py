@@ -21,6 +21,7 @@ import math
 import timm.optim.optim_factory as optim_factory
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 NUM_CHANNELS = 12
 
@@ -62,7 +63,7 @@ def mp_train_mae_coordinate(mae_mdl_bnk, msg_in_queues, msg_out_queues, args):
         drop_last=True,
     )
 
-    avg_losses = [{"reconstruction_loss":0,"alignment_loss":0} for i in range(NUM_CHANNELS+1)]
+    avg_losses = [{"reconstruction_loss":0,"strong_reconstruction_loss":0,"alignment_loss":0} for i in range(NUM_CHANNELS+1)]
 
     cur_best_loss = 1000000
 
@@ -73,10 +74,11 @@ def mp_train_mae_coordinate(mae_mdl_bnk, msg_in_queues, msg_out_queues, args):
 
         for i in range(len(avg_losses)):
             avg_losses[i]['reconstruction_loss'] = 0
+            avg_losses[i]['strong_reconstruction_loss'] = 0
             avg_losses[i]['alignment_loss'] = 0
 
         print(f'---EPOCH = {epoch}---')
-        for data_iter_step, samples in enumerate(data_loader_train):
+        for data_iter_step, samples in tqdm(enumerate(data_loader_train),total=len(data_loader_train)):
 
         
             X = samples.to(torch.float32)
@@ -144,6 +146,7 @@ def mp_train_mae_coordinate(mae_mdl_bnk, msg_in_queues, msg_out_queues, args):
                 msg = msg_in_queues[mdl_idx].get(block=True, timeout=None)
                                 
                 avg_losses[mdl_idx]['reconstruction_loss'] += msg.msg_content['reconstruction_loss'].item() * batch_size
+                avg_losses[mdl_idx]['strong_reconstruction_loss'] += msg.msg_content['strong_reconstruction_loss'].item() * batch_size
                 avg_losses[mdl_idx]['alignment_loss'] += msg.msg_content['alignment_loss'].item() * batch_size                
                 
                 
@@ -152,23 +155,26 @@ def mp_train_mae_coordinate(mae_mdl_bnk, msg_in_queues, msg_out_queues, args):
         for mdl_idx in range(NUM_CHANNELS):
 
             avg_losses[mdl_idx]['reconstruction_loss'] /= total_samples
+            avg_losses[mdl_idx]['strong_reconstruction_loss'] /= total_samples            
             avg_losses[mdl_idx]['alignment_loss'] /= total_samples
             
             avg_losses[-1]['reconstruction_loss'] += avg_losses[mdl_idx]['reconstruction_loss'] / NUM_CHANNELS
+            avg_losses[-1]['strong_reconstruction_loss'] += avg_losses[mdl_idx]['strong_reconstruction_loss'] / NUM_CHANNELS            
             avg_losses[-1]['alignment_loss'] += avg_losses[mdl_idx]['alignment_loss'] / NUM_CHANNELS
 
-            print(f"\t\t<Channel {mdl_idx+1}> reconstruction_loss {avg_losses[mdl_idx]['reconstruction_loss']} | alignment_loss {avg_losses[mdl_idx]['alignment_loss']}")
+            print(f"\t\t<Channel {mdl_idx+1}> reconstruction_loss {avg_losses[mdl_idx]['reconstruction_loss']} | strong_reconstruction_loss {avg_losses[mdl_idx]['strong_reconstruction_loss']} | alignment_loss {avg_losses[mdl_idx]['alignment_loss']}")
 
             #tflog_writer.add_scalar(f'Channel {mdl_idx+1}/reconstruction_loss', avg_losses[mdl_idx]['reconstruction_loss'], epoch)
             #tflog_writer.add_scalar(f'Channel {mdl_idx+1}/alignment_loss', avg_losses[mdl_idx]['alignment_loss'], epoch)
 
-        print(f"\t\t<Combined> reconstruction_loss {avg_losses[-1]['reconstruction_loss']} | alignment_loss {avg_losses[-1]['alignment_loss']}")
+        print(f"\t\t<Combined> reconstruction_loss {avg_losses[-1]['reconstruction_loss']} | strong_reconstruction_loss {avg_losses[-1]['strong_reconstruction_loss']} | alignment_loss {avg_losses[-1]['alignment_loss']}")
 
         #tflog_writer.add_scalar(f'Combined/reconstruction_loss', avg_losses[-1]['reconstruction_loss'], epoch)
         #tflog_writer.add_scalar(f'Combined/alignment_loss', avg_losses[-1]['alignment_loss'], epoch)
 
-        total_loss = avg_losses[-1]['reconstruction_loss'] + avg_losses[-1]['alignment_loss']
+        total_loss = avg_losses[-1]['reconstruction_loss'] + avg_losses[-1]['strong_reconstruction_loss'] + avg_losses[-1]['alignment_loss']
 
+        '''
         if epoch%5==0:
             for mdl_idx in range(NUM_CHANNELS):
 
@@ -178,7 +184,7 @@ def mp_train_mae_coordinate(mae_mdl_bnk, msg_in_queues, msg_out_queues, args):
 
                                           },f'epoch-{epoch}')
                                           , block=True, timeout=None)
-
+        '''
 
         if(cur_best_loss >total_loss):
             
@@ -216,6 +222,8 @@ def mp_train_mae_process(mae_mdl, mae_optmzr, mae_schdlr, dvc, chnl_id, msg_in_q
 
     mae_mdl.to(dvc)
     mae_mdl.train()
+
+    log_counter = 0
     
     param_groups = optim_factory.add_weight_decay(mae_mdl, args.weight_decay)
 
@@ -276,8 +284,10 @@ def mp_train_mae_process(mae_mdl, mae_optmzr, mae_schdlr, dvc, chnl_id, msg_in_q
             embd_response = Message(msg_type='Generated_Embedding', msg_content=cur_latent.detach().to('cpu').clone(), msg_seq_no=msg.msg_seq_no)
             msg_out_queue.put(embd_response, block=True, timeout=None)
 
-            pred = mae_mdl.forward_decoder(cur_latent, ids_restore)
+            pred, fin_dec = mae_mdl.forward_decoder(cur_latent, ids_restore)
+            str_pred = mae_mdl.forward_decoder_strong(fin_dec.detach().clone())
             cur_rec_loss = mae_mdl.reconstruction_loss(dta, pred, mask)
+            cur_str_rec_loss = mae_mdl.strong_reconstruction_loss(dta, str_pred)
 
             mask = mask.to('cpu')
             dta = dta.to('cpu')
@@ -285,6 +295,7 @@ def mp_train_mae_process(mae_mdl, mae_optmzr, mae_schdlr, dvc, chnl_id, msg_in_q
             ids_restore = ids_restore.to('cpu')
             ids_keep = ids_keep.to('cpu')
             pred = pred.to('cpu')
+            str_pred = str_pred.to('cpu')
 
         elif msg.msg_type == 'ALIGN_EMBEDDING':
 
@@ -294,12 +305,14 @@ def mp_train_mae_process(mae_mdl, mae_optmzr, mae_schdlr, dvc, chnl_id, msg_in_q
             loss_response = Message(msg_type='Computed_Loss', 
                                     msg_content={
                                         'reconstruction_loss':cur_rec_loss.detach().to('cpu').clone(),
+                                        'strong_reconstruction_loss':cur_str_rec_loss.detach().to('cpu').clone(),
                                         'alignment_loss':cur_align_loss.detach().to('cpu').clone()
                                         },
                                     msg_seq_no=msg.msg_seq_no)
             msg_out_queue.put(loss_response, block=True, timeout=None)
 
             cur_total_loss = (cur_rec_loss  * recnstrcn_ls_wgt + cur_align_loss * algnmnt_ls_wgt) / ( recnstrcn_ls_wgt+algnmnt_ls_wgt )
+            cur_total_loss = cur_total_loss + cur_str_rec_loss
             cur_total_loss = cur_total_loss / args.grad_accum_steps
             cur_total_loss.backward()
 
@@ -309,11 +322,14 @@ def mp_train_mae_process(mae_mdl, mae_optmzr, mae_schdlr, dvc, chnl_id, msg_in_q
 
             cur_total_loss = cur_total_loss.detach().to('cpu')
             cur_rec_loss = cur_rec_loss.detach().to('cpu')
+            cur_str_rec_loss = cur_str_rec_loss.detach().to('cpu')
             cur_align_loss = cur_align_loss.detach().to('cpu')
             all_latents = all_latents.detach().to('cpu')
             cur_latent = cur_latent.detach().to('cpu')
 
-            print(f"({str(datetime.now()).split(' ')[1][:8]}) [{msg.msg_seq_no}]<Channel {chnl_id}> reconstruction_loss {cur_rec_loss.item()} | alignment_loss {cur_align_loss.item()}")
+            if log_counter==0:
+                print(f"({str(datetime.now()).split(' ')[1][:8]}) [{msg.msg_seq_no}]<Channel {chnl_id}> reconstruction_loss {cur_rec_loss.item()} | strong reconstruction_loss {cur_str_rec_loss.item()} | alignment_loss {cur_align_loss.item()}")
+                log_counter = (log_counter+1)%10
 
             
 
