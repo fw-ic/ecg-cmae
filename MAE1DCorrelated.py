@@ -8,6 +8,7 @@ import torch.nn as nn
 from util.pos_embed import get_1d_sincos_pos_embed
 from typing import Callable, List, Optional, Tuple, Union
 from timm.models.vision_transformer import Block
+from swin_utils import Swin1DBlock
 
 
 def cosine_distance(x1,x2):
@@ -228,19 +229,59 @@ class Decoder(nn.Module):
         # apply Transformer blocks
         for blk in self.decoder_blocks:
             x = blk(x)
-        x = self.decoder_norm(x)
+        fin_x = self.decoder_norm(x)
 
         # predictor projection
-        x = self.decoder_pred(x)
+        x = self.decoder_pred(fin_x)
 
         # remove cls token
+        fin_x = fin_x[:, 1:, :]
         x = x[:, 1:, :]
 
 
         ## handle nan
         ####x = torch.where(x.isnan(),0,x)
 
-        return x
+        return x, fin_x
+
+class DecoderStrong(nn.Module):
+
+    def __init__(self,decoder_embed_dim=512):
+        super().__init__()
+
+        drop_rate = [0,0.02,0.04,0.06,0.08,0.1]
+
+        self.attn1 = Swin1DBlock(dim=decoder_embed_dim,num_heads=8,window_size=5,drop_path=drop_rate[0])
+        self.up1 = torch.nn.ConvTranspose1d(decoder_embed_dim,decoder_embed_dim//2,kernel_size=2,stride=2)
+        self.attn2 = Swin1DBlock(dim=decoder_embed_dim//2,num_heads=8,window_size=10,drop_path=drop_rate[1])
+        self.up2 = torch.nn.ConvTranspose1d(decoder_embed_dim//2,decoder_embed_dim//4,kernel_size=2,stride=2)
+        self.attn3 = Swin1DBlock(dim=decoder_embed_dim//4,num_heads=8,window_size=20,drop_path=drop_rate[2])
+        self.up3 = torch.nn.ConvTranspose1d(decoder_embed_dim//4,decoder_embed_dim//8,kernel_size=2,stride=2)
+        self.attn4 = Swin1DBlock(dim=decoder_embed_dim//8,num_heads=8,window_size=40,drop_path=drop_rate[3])
+        self.up4 = torch.nn.ConvTranspose1d(decoder_embed_dim//8,decoder_embed_dim//16,kernel_size=2,stride=2)
+        self.attn5 = Swin1DBlock(dim=decoder_embed_dim//16,num_heads=8,window_size=80,drop_path=drop_rate[4])
+        self.up5 = torch.nn.ConvTranspose1d(decoder_embed_dim//16,decoder_embed_dim//32,kernel_size=2,stride=2)
+        self.attn6 = Swin1DBlock(dim=decoder_embed_dim//32,num_heads=8,window_size=160,drop_path=drop_rate[5])
+        self.up6 = torch.nn.ConvTranspose1d(decoder_embed_dim//32,decoder_embed_dim//32,kernel_size=2,stride=2)
+        self.out = torch.nn.Conv1d(decoder_embed_dim//32,1,kernel_size=5,padding=2)
+
+    def forward(self, x):
+        
+        x1 = self.attn1(x)
+        x1 = self.up1(x1.permute(0,2,1)).permute(0,2,1)
+        x2 = self.attn2(x1)
+        x2 = self.up2(x2.permute(0,2,1)).permute(0,2,1)
+        x3 = self.attn3(x2)
+        x3 = self.up3(x3.permute(0,2,1)).permute(0,2,1)
+        x4 = self.attn4(x3)
+        x4 = self.up4(x4.permute(0,2,1)).permute(0,2,1)
+        x5 = self.attn5(x4)
+        x5 = self.up5(x5.permute(0,2,1)).permute(0,2,1)
+        x6 = self.attn6(x5)
+        x6 = self.up6(x6.permute(0,2,1)).permute(0,2,1)
+        x7 = self.out(x6.permute(0,2,1))
+
+        return x7
 
 
 class MaskedAutoencoderViT1DCorrelated(nn.Module):
@@ -272,6 +313,8 @@ class MaskedAutoencoderViT1DCorrelated(nn.Module):
         #self.correlator = Correlator(channel_id, embed_dim, embed_squeeze)
 
         self.decoder = Decoder(in_chans, self.window_len, self.num_patches, embed_dim, decoder_embed_dim, decoder_depth, decoder_num_heads, mlp_ratio, norm_layer)
+
+        self.str_decoder = DecoderStrong(decoder_embed_dim)
 
         
         # --------------------------------------------------------------------------
@@ -336,7 +379,6 @@ class MaskedAutoencoderViT1DCorrelated(nn.Module):
         noise = noise.to('cpu')
         
         return ids_shuffle, ids_restore, ids_keep
-
 
 
     def perform_masking(self, x, mask_ratio, ids_restore, ids_keep):
@@ -414,8 +456,8 @@ class MaskedAutoencoderViT1DCorrelated(nn.Module):
 
     def forward_decoder(self, x, ids_restore):
 
-        x = self.decoder(x, ids_restore)
-        return x
+        x,fin_x = self.decoder(x, ids_restore)
+        return x,fin_x
         # embed tokens
         x = self.decoder_embed(x)
 
@@ -444,6 +486,9 @@ class MaskedAutoencoderViT1DCorrelated(nn.Module):
         ####x = torch.where(x.isnan(),0,x)
 
         return x
+
+    def forward_decoder_strong(self, x):
+        return self.str_decoder(x)
 
     def alignment_loss(self, own_embds, all_embds):
 
@@ -491,6 +536,26 @@ class MaskedAutoencoderViT1DCorrelated(nn.Module):
 
         loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
         return loss
+
+
+    def strong_reconstruction_loss(self, sigs, pred):
+        """
+        imgs: [N, 3, H, W]
+        pred: [N, L, p*p*3]
+        mask: [N, L], 0 is keep, 1 is remove, 
+        """
+        target = sigs[:,:,450:-450]
+
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1.e-6)**.5
+
+        loss = (pred - target) ** 2
+        loss = loss.mean()
+
+        return loss
+
 
 
     def predict_reconstruction(self, sigs_all,num_patches, mask_ratio=0.75):
